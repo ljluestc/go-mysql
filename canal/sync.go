@@ -1,9 +1,10 @@
 package canal
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
-
+	"strings"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/schema"
@@ -34,44 +35,105 @@ func (c *Canal) startSyncer() (*replication.BinlogStreamer, error) {
 }
 
 func (c *Canal) runSyncBinlog() error {
-	s, err := c.startSyncer()
-	if err != nil {
-		return err
-	}
+    defer func() {
+        c.cancel()
+    }()
 
-	for {
-		ev, err := s.GetEvent(c.ctx)
-		if err != nil {
-			return errors.Trace(err)
-		}
+    for {
+        select {
+        case <-c.ctx.Done():
+            return nil
+        default:
+            pos := c.master.Position()
+            c.cfg.Logger.Infof("begin to re-sync from (%s, %d)", pos.Name, pos.Pos)
+            streamer, err := c.syncer.StartSync(pos)
+            if err != nil {
+                c.cfg.Logger.Errorf("start sync binlog failed: %v", err)
+                if strings.Contains(err.Error(), "ERROR 1236 (HY000)") && strings.Contains(err.Error(), "position > file size") {
+                    c.cfg.Logger.Warnf("position %d exceeds file size in %s, attempting recovery", pos.Pos, pos.Name)
+                    if newPos, recoveryErr := c.recoverFromPositionError(pos); recoveryErr == nil {
+                        c.cfg.Logger.Infof("recovered to new position: %s, %d", newPos.Name, newPos.Pos)
+                        c.master.Update(newPos)
+                        continue
+                    } else {
+                        c.cfg.Logger.Errorf("recovery failed: %v", recoveryErr)
+                        return errors.Trace(recoveryErr)
+                    }
+                }
+                return errors.Trace(err)
+            }
 
-		// Update the delay between the Canal and the Master before the handler hooks are called
-		c.updateReplicationDelay(ev)
+            for {
+                ev, err := streamer.GetEvent(c.ctx)
+                if err != nil {
+                    if strings.Contains(err.Error(), "ERROR 1236 (HY000)") && strings.Contains(err.Error(), "position > file size") {
+                        c.cfg.Logger.Warnf("position error detected during sync at %s:%d, attempting recovery", pos.Name, pos.Pos)
+                        if newPos, recoveryErr := c.recoverFromPositionError(pos); recoveryErr == nil {
+                            c.cfg.Logger.Infof("recovered to new position: %s, %d", newPos.Name, newPos.Pos)
+                            c.master.Update(newPos)
+                            break
+                        } else {
+                            c.cfg.Logger.Errorf("recovery failed: %v", recoveryErr)
+                            return errors.Trace(recoveryErr)
+                        }
+                    }
+                    if errors.Cause(err) == context.Canceled {
+                        return nil
+                    }
+                    c.cfg.Logger.Errorf("get binlog event failed: %v", err)
+                    return errors.Trace(err)
+                }
 
-		switch e := ev.Event.(type) {
-		case *replication.RotateEvent:
-			// If the timestamp equals zero, the received rotate event is a fake rotate event
-			// and contains only the name of the next binlog file. Its log position should be
-			// ignored.
-			// See https://github.com/mysql/mysql-server/blob/8e797a5d6eb3a87f16498edcb7261a75897babae/sql/rpl_binlog_sender.h#L235
-			// and https://github.com/mysql/mysql-server/blob/8cc757da3d87bf4a1f07dcfb2d3c96fed3806870/sql/rpl_binlog_sender.cc#L899
-			if ev.Header.Timestamp == 0 {
-				fakeRotateLogName := string(e.NextLogName)
-				c.cfg.Logger.Infof("received fake rotate event, next log name is %s", e.NextLogName)
+                c.updateReplicationDelay(ev)
 
-				if fakeRotateLogName != c.master.Position().Name {
-					c.cfg.Logger.Info("log name changed, the fake rotate event will be handled as a real rotate event")
-				} else {
-					continue
-				}
-			}
-		}
+                switch e := ev.Event.(type) {
+                case *replication.RotateEvent:
+                    if ev.Header.Timestamp == 0 {
+                        fakeRotateLogName := string(e.NextLogName)
+                        c.cfg.Logger.Infof("received fake rotate event, next log name is %s", fakeRotateLogName)
+                        if fakeRotateLogName != c.master.Position().Name {
+                            c.cfg.Logger.Info("log name changed, treating fake rotate as real")
+                        } else {
+                            continue
+                        }
+                    }
+                }
 
-		err = c.handleEvent(ev)
-		if err != nil {
-			return err
-		}
-	}
+                if err := c.handleEvent(ev); err != nil {
+                    return errors.Trace(err)
+                }
+            }
+        }
+    }
+}
+
+// Placeholder for required functions (normally in canal.go)
+func (c *Canal) recoverFromPositionError(pos mysql.Position) (mysql.Position, error) {
+    res, err := c.Execute("SHOW BINARY LOGS")
+    if err != nil {
+        return pos, errors.Annotate(err, "failed to query binary logs for recovery")
+    }
+
+    currentFile := pos.Name
+    var nextFile string
+    foundCurrent := false
+
+    for i := 0; i < res.RowNumber(); i++ {
+        logFile, _ := res.GetString(i, 0)
+        if foundCurrent && nextFile == "" {
+            nextFile = logFile
+        }
+        if logFile == currentFile {
+            foundCurrent = true
+        }
+    }
+
+    if nextFile == "" {
+        return pos, errors.New("no next binlog file available for recovery")
+    }
+
+    newPos := mysql.Position{Name: nextFile, Pos: 4}
+    return newPos, nil
 }
 
 func (c *Canal) handleEvent(ev *replication.BinlogEvent) error {

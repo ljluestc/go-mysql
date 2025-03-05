@@ -105,6 +105,7 @@ func (s *canalTestSuite) SetupSuite() {
 		err = s.c.StartFromGTID(set)
 		require.NoError(s.T(), err)
 	}()
+	s.Run("TestRunSyncBinlogError1236", s.TestRunSyncBinlogError1236)
 }
 
 func (s *canalTestSuite) TearDownSuite() {
