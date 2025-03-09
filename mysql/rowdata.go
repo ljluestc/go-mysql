@@ -256,3 +256,146 @@ func (p RowData) ParseBinary(f []*Field, dst []FieldValue) ([]FieldValue, error)
 
 	return data, nil
 }
+
+// WKB constants
+const (
+    WKBPoint   = 0x00000001
+    WKBPolygon = 0x00000003
+)
+
+// ParseWKBPoint parses a POINT from WKB format
+func ParseWKBPoint(data []byte) (x, y float64, err error) {
+    if len(data) < 25 || binary.LittleEndian.Uint32(data[1:5]) != WKBPoint {
+        return 0, 0, fmt.Errorf("invalid WKB POINT data: %x", data)
+    }
+    x = binary.LittleEndian.Float64(data[9:17])  // X coordinate
+    y = binary.LittleEndian.Float64(data[17:25]) // Y coordinate
+    return x, y, nil
+}
+
+// ParseWKBPolygon parses a POLYGON from WKB format
+func ParseWKBPolygon(data []byte) ([][][2]float64, error) {
+    if len(data) < 13 || binary.LittleEndian.Uint32(data[1:5]) != WKBPolygon {
+        return nil, fmt.Errorf("invalid WKB POLYGON data: %x", data)
+    }
+    numRings := binary.LittleEndian.Uint32(data[9:13])
+    if len(data) < int(13+numRings*4) {
+        return nil, fmt.Errorf("incomplete WKB POLYGON data")
+    }
+
+    rings := make([][][2]float64, numRings)
+    offset := 13
+    for i := uint32(0); i < numRings; i++ {
+        numPoints := binary.LittleEndian.Uint32(data[offset : offset+4])
+        offset += 4
+        if len(data) < int(offset+numPoints*16) {
+            return nil, fmt.Errorf("incomplete POLYGON ring data")
+        }
+        points := make([][2]float64, numPoints)
+        for j := uint32(0); j < numPoints; j++ {
+            x := binary.LittleEndian.Float64(data[offset : offset+8])
+            y := binary.LittleEndian.Float64(data[offset+8 : offset+16])
+            points[j] = [2]float64{x, y}
+            offset += 16
+        }
+        rings[i] = points
+    }
+    return rings, nil
+}
+
+// readRowData parses binary row data from a binlog event
+func (r *RowsEvent) readRowData(table *schema.Table, data []byte) ([]interface{}, error) {
+    values := make([]interface{}, len(table.Columns))
+    nullBitmap := data[:((len(table.Columns)+7)/8)]
+    data = data[((len(table.Columns)+7)/8):]
+
+    pos := 0
+    for i, col := range table.Columns {
+        if nullBitmap[i/8]&(1<<(uint(i)%8)) != 0 {
+            values[i] = nil
+            continue
+        }
+
+        switch col.Type {
+        case MYSQL_TYPE_TINY:
+            values[i] = int8(data[pos])
+            pos++
+        case MYSQL_TYPE_SHORT:
+            values[i] = int16(binary.LittleEndian.Uint16(data[pos : pos+2]))
+            pos += 2
+        case MYSQL_TYPE_INT24:
+            values[i] = int32(ParseBinaryInt24(data[pos : pos+3]))
+            pos += 3
+        case MYSQL_TYPE_LONG:
+            values[i] = int32(binary.LittleEndian.Uint32(data[pos : pos+4]))
+            pos += 4
+        case MYSQL_TYPE_LONGLONG:
+            values[i] = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+            pos += 8
+        case MYSQL_TYPE_FLOAT:
+            values[i] = float32(binary.LittleEndian.Uint32(data[pos : pos+4]))
+            pos += 4
+        case MYSQL_TYPE_DOUBLE:
+            values[i] = float64(binary.LittleEndian.Uint64(data[pos : pos+8]))
+            pos += 8
+        case MYSQL_TYPE_VARCHAR, MYSQL_TYPE_STRING, MYSQL_TYPE_VAR_STRING:
+            length := int(data[pos])
+            if length >= 255 {
+                length = int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+                pos += 2
+            } else {
+                pos++
+            }
+            values[i] = string(data[pos : pos+length])
+            pos += length
+        case MYSQL_TYPE_NEWDECIMAL:
+            // Simplified decimal handling (adjust as per actual implementation)
+            length := int(data[pos])
+            pos++
+            values[i] = string(data[pos : pos+length])
+            pos += length
+        case MYSQL_TYPE_GEOMETRY:
+            // Handle geospatial data
+            length := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+            pos += 2
+            geoData := data[pos : pos+length]
+            pos += length
+            switch col.RawType {
+            case "point":
+                x, y, err := ParseWKBPoint(geoData)
+                if err != nil {
+                    return nil, fmt.Errorf("failed to parse POINT at column %d: %v", i, err)
+                }
+                values[i] = fmt.Sprintf("POINT(%f %f)", x, y) // WKT format
+            case "polygon":
+                rings, err := ParseWKBPolygon(geoData)
+                if err != nil {
+                    return nil, fmt.Errorf("failed to parse POLYGON at column %d: %v", i, err)
+                }
+                // Convert to WKT format for simplicity
+                var wkt strings.Builder
+                wkt.WriteString("POLYGON(")
+                for j, ring := range rings {
+                    if j > 0 {
+                        wkt.WriteString(",")
+                    }
+                    wkt.WriteString("(")
+                    for k, point := range ring {
+                        if k > 0 {
+                            wkt.WriteString(",")
+                        }
+                        fmt.Fprintf(&wkt, "%f %f", point[0], point[1])
+                    }
+                    wkt.WriteString(")")
+                }
+                wkt.WriteString(")")
+                values[i] = wkt.String()
+            default:
+                return nil, fmt.Errorf("unsupported geometry type: %s", col.RawType)
+            }
+        default:
+            return nil, fmt.Errorf("unsupported column type %d at column %d", col.Type, i)
+        }
+    }
+    return values, nil
+}

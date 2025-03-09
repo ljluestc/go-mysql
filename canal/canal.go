@@ -559,3 +559,12 @@ func (c *Canal) SyncedTimestamp() uint32 {
 func (c *Canal) SyncedGTIDSet() mysql.GTIDSet {
 	return c.master.GTIDSet()
 }
+func (c *Canal) parseRows(e *mysql.RowsEvent) {
+    table := c.GetTable(e.Table)
+    values, err := e.Rows.readRowData(table, e.Rows.Data[e.Rows.RowIndex])
+    if err != nil {
+        log.Errorf("canal dump mysql err: parse row %v at %d error %v", e.Rows.Data[e.Rows.RowIndex], e.Rows.RowIndex, err)
+        return
+    }
+    log.Infof("Parsed row values: %v", values)
+}
